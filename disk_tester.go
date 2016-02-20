@@ -13,12 +13,13 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	DevUrandom = "/dev/urandom"
+	DevUrandom    = "/dev/urandom"
 	FillBlockSize = 1024 * 1024
 )
 
@@ -80,9 +81,9 @@ func (d *DiskTest) fill(buffer []byte) (time.Duration, error) {
 	blockSize := d.BlockSize
 	if d.FileSizeBlocks < FillBlockSize {
 		factor := int64(FillBlockSize) / d.BlockSize
-		rest := FillBlockSize - factor * d.BlockSize
+		rest := FillBlockSize - factor*d.BlockSize
 		var newBuffer []byte
-		for i := 0; i < int(factor) - 1; i++ {
+		for i := 0; i < int(factor)-1; i++ {
 			newBuffer = append(newBuffer, buffer...)
 		}
 		if rest > 0 {
@@ -115,7 +116,7 @@ func (d *DiskTest) fill(buffer []byte) (time.Duration, error) {
 
 func testOp(name string, offset int64, buffer []byte, write bool) (time.Duration, error) {
 	start := time.Now()
-	f, err := os.OpenFile(name, os.O_RDWR | syscall.O_DIRECT, 0666)
+	f, err := os.OpenFile(name, os.O_RDWR|syscall.O_DIRECT, 0666)
 	defer f.Close()
 	if err != nil {
 		return time.Since(start), err
@@ -135,14 +136,14 @@ func testOp(name string, offset int64, buffer []byte, write bool) (time.Duration
 }
 
 type TestResults struct {
-	SingleResults []time.Duration
-	TotalTime     time.Duration
-	AverageTime   time.Duration
-	MaxTime		time.Duration
-	MinTime		time.Duration
-	StDev		time.Duration
+	SingleResults     []time.Duration
+	TotalTime         time.Duration
+	AverageTime       time.Duration
+	MaxTime           time.Duration
+	MinTime           time.Duration
+	StDev             time.Duration
 	AverageThroughput float64
-	Writer		bool
+	Writer            bool
 }
 
 func (t *TestResults) ComputeTestResults(blockSize int64) {
@@ -165,14 +166,14 @@ func (t *TestResults) ComputeTestResults(blockSize int64) {
 	var sumDeviations uint64
 	for i, d := range t.SingleResults {
 		dev := d - t.AverageTime
-		deviations[i] = dev*dev
+		deviations[i] = dev * dev
 		sumDeviations += uint64(deviations[i])
 	}
 	t.StDev = time.Duration(int64(math.Sqrt(float64(sumDeviations) / float64(len(t.SingleResults)))))
 	if blockSize > 0 {
 		totalData := float64(blockSize * int64(len(t.SingleResults)))
 		totalSeconds := float64(t.TotalTime.Nanoseconds()) / 1000000000.0
-		t.AverageThroughput =  totalData / totalSeconds / (1024.0 * 1024.0) 
+		t.AverageThroughput = totalData / totalSeconds / (1024.0 * 1024.0)
 	}
 }
 
@@ -212,48 +213,60 @@ func (d *DiskTest) Run(results chan TestResults, numIter uint, seq int) {
 }
 
 var (
-	FileName = flag.String("file_name", "/var/tmp/test.bin", "File name and path for test")
-	FileSize = flag.Int64("file_size", 1024, "File size in MB")
-	BlockSize = flag.Int64("block_size", 4096, "Block size in bytes")
+	FileName   = flag.String("file_name", "/var/tmp/test.bin", "File name and path for test")
+	FileSize   = flag.Int64("file_size", 1024, "File size in MB")
+	BlockSize  = flag.Int64("block_size", 4096, "Block size in bytes")
 	NumWriters = flag.Int("num_writers", 4, "Number of writers")
 	NumReaders = flag.Int("num_readers", 4, "Number of readers")
-	NumIters = flag.Uint("num_iterations", 1000, "Number of iterations")
+	NumIters   = flag.Uint("num_iterations", 1000, "Number of iterations")
 )
+
+func wait(wg *sync.WaitGroup, results chan TestResults) {
+	defer close(results)
+	wg.Wait()
+}
 
 func main() {
 	flag.Parse()
-	*FileSize =  1024 * 1024 * *FileSize
+	*FileSize = 1024 * 1024 * *FileSize
 	d, err := NewDiskTest(*FileName, *FileSize, *BlockSize, true)
 	if err != nil {
 		log.Fatalf("Error creating tester %v", err)
 	}
 	d.Init()
 	res, err := d.FillWithRandom()
-	tMs := int64(res.Nanoseconds()/ 1000000)
+	tMs := int64(res.Nanoseconds() / 1000000)
 	transfer := float64(*FileSize) / float64(tMs) / 1000
 	fmt.Printf("Wrote %v bytes in %v miliseconds, throughput %v MB/s, err : %v\n", *FileSize, tMs, transfer, err)
 	results := make(chan TestResults)
-	for i := 0; i < *NumWriters; i ++ {
+	var wg sync.WaitGroup
+	for i := 0; i < *NumWriters; i++ {
 		writer, err := NewDiskTest(*FileName, *FileSize, *BlockSize, true)
 		if err != nil {
 			log.Fatalf("Error creating writer: %v\n", err)
 		}
-//		log.Printf("Created writer %v, starting", i)
-		go writer.Run(results, *NumIters, i)
+		wg.Add(1)
+		go func(results chan TestResults, NumIters uint, i int) {
+			writer.Run(results, NumIters, i)
+			wg.Done()
+		}(results, *NumIters, i)
 	}
-	for i := 0; i < *NumReaders; i ++ {
+	for i := 0; i < *NumReaders; i++ {
 		reader, err := NewDiskTest(*FileName, *FileSize, *BlockSize, false)
 		if err != nil {
 			log.Fatalf("Error creating reader: %v\n", err)
 		}
-//		log.Printf("Created reader %v, starting", i + 10000)
-		go reader.Run(results, *NumIters, i + 10000)
+		wg.Add(1)
+		go func(results chan TestResults, NumIters uint, i int) {
+			reader.Run(results, NumIters, i+10000)
+			wg.Done()
+		}(results, *NumIters, i+10000)
 	}
 	log.Println("All threads started")
 	var globalWriteResults TestResults
 	var globalReadResults TestResults
-	for i := 0; i < *NumWriters + *NumReaders; i++ {
-		t := <-results
+	go wait(&wg, results)
+	for t := range results {
 		fmt.Printf("Writer: %v Total: %v Average: %v StDev: %v NrOfProbes: %v Throughput: %vMB/s \n", t.Writer, t.TotalTime, t.AverageTime, t.StDev, len(t.SingleResults), t.AverageThroughput)
 		if t.Writer {
 			globalWriteResults.AddResults(&t)
